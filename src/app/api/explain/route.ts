@@ -4,6 +4,8 @@ import { getCachedExplanation, cacheExplanation } from "@/services/cache/supabas
 import { aiService } from "@/services/ai/mock";
 import type { DepthLevel } from "@/types/paper";
 
+export const runtime = "edge";
+
 const VALID_DEPTHS: DepthLevel[] = ["high-school", "undergrad", "graduate", "expert"];
 const MAX_TEXT_LENGTH = 500_000; // ~500KB of text
 

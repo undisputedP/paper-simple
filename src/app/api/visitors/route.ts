@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { trackVisit, getVisitorCount } from "@/services/analytics/visitors";
 
+export const runtime = "edge";
+
 export async function GET() {
   try {
     const count = await getVisitorCount();

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabase, isSupabaseConfigured } from "@/lib/supabase";
 import { sanitizeReviewName, sanitizeReviewComment } from "@/lib/security";
 
+export const runtime = "edge";
+
 export async function GET() {
   if (!isSupabaseConfigured()) {
     return NextResponse.json({ reviews: [], fallback: true });
