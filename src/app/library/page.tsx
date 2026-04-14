@@ -1,38 +1,24 @@
-"use client";
+import type { Metadata } from "next";
+import LibraryContent from "./LibraryContent";
 
-import { usePaperLibrary } from "@/hooks/usePaperLibrary";
-import { PaperGrid } from "@/components/library/PaperGrid";
-import { Input } from "@/components/ui/input";
-import { Search, Library } from "lucide-react";
+export const metadata: Metadata = {
+  title: "Your Paper Library",
+  description:
+    "Browse and search your saved research paper explanations. All papers are stored locally in your browser for privacy.",
+  openGraph: {
+    title: "Your Paper Library | PaperSimple",
+    description: "Browse your saved research paper explanations.",
+    url: "https://papersimple.pages.dev/library",
+  },
+  robots: {
+    index: false,
+    follow: true,
+  },
+  alternates: {
+    canonical: "https://papersimple.pages.dev/library",
+  },
+};
 
 export default function LibraryPage() {
-  const { papers, search, setSearch, deletePaper } = usePaperLibrary();
-
-  return (
-    <div className="mx-auto max-w-5xl px-4 py-10">
-      <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <div className="flex items-center gap-2">
-            <Library className="h-6 w-6 text-primary" />
-            <h1 className="text-2xl font-bold">Your Library</h1>
-          </div>
-          <p className="mt-1 text-sm text-muted-foreground">
-            All the papers you've explained, saved locally in your browser.
-          </p>
-        </div>
-
-        <div className="relative w-full sm:w-64">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search papers..."
-            className="pl-9"
-          />
-        </div>
-      </div>
-
-      <PaperGrid papers={papers} onDelete={deletePaper} />
-    </div>
-  );
+  return <LibraryContent />;
 }
