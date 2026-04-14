@@ -5,211 +5,638 @@ import type {
   QAMessage,
 } from "@/types/paper";
 
-const DEPTH_LABELS: Record<DepthLevel, string> = {
-  "high-school": "High School",
-  undergrad: "Undergraduate",
-  graduate: "Graduate",
-  expert: "Expert",
-};
+// ─────────────────────────────────────────────
+// Common English stopwords to filter out
+// ─────────────────────────────────────────────
+const STOPWORDS = new Set([
+  "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of",
+  "with", "by", "from", "is", "are", "was", "were", "be", "been", "being",
+  "have", "has", "had", "do", "does", "did", "will", "would", "could",
+  "should", "may", "might", "can", "shall", "that", "this", "these", "those",
+  "it", "its", "we", "our", "they", "their", "them", "he", "she", "his",
+  "her", "not", "no", "if", "then", "than", "as", "so", "also", "more",
+  "most", "such", "each", "which", "where", "when", "what", "how", "who",
+  "all", "both", "any", "some", "many", "much", "very", "just", "only",
+  "still", "even", "well", "back", "about", "up", "out", "into", "over",
+  "after", "before", "between", "through", "during", "while", "because",
+  "since", "until", "although", "however", "therefore", "thus", "hence",
+  "use", "used", "using", "one", "two", "three", "new", "first", "show",
+  "shown", "shows", "based", "paper", "approach", "propose", "proposed",
+  "result", "results", "method", "table", "figure", "section", "et", "al",
+  "work", "different", "number", "set", "see", "given", "following",
+  "respectively", "i.e", "e.g", "fig", "eq", "ref", "able", "per",
+]);
+
+// ─────────────────────────────────────────────
+// Text Analysis Engine
+// ─────────────────────────────────────────────
+
+interface PaperAnalysis {
+  abstract: string;
+  sectionContents: Map<string, string>;
+  sectionOrder: string[];
+  keyTerms: { term: string; count: number }[];
+  keySentences: {
+    problem: string[];
+    method: string[];
+    results: string[];
+    impact: string[];
+  };
+  metrics: string[];
+  mainTopic: string;
+}
+
+/**
+ * Find sentences in text that match certain criteria
+ */
+function findSentences(
+  text: string,
+  keywords: string[],
+  maxCount: number = 3
+): string[] {
+  const sentences = text
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .filter((s) => s.length > 30 && s.length < 400);
+
+  const scored = sentences.map((s) => {
+    const lower = s.toLowerCase();
+    let score = 0;
+    for (const kw of keywords) {
+      if (lower.includes(kw.toLowerCase())) score++;
+    }
+    // Prefer sentences that aren't just references
+    if (/\[\d+\]/.test(s)) score -= 0.5;
+    if (/fig\w*\s*\d/i.test(s)) score -= 0.5;
+    return { sentence: s, score };
+  });
+
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxCount)
+    .filter((s) => s.score > 0)
+    .map((s) => s.sentence.trim());
+}
+
+/**
+ * Extract the most frequent meaningful terms from the text
+ */
+function extractKeyTerms(
+  text: string,
+  count: number = 10
+): { term: string; count: number }[] {
+  const words = text.toLowerCase().match(/[a-z][a-z-]{2,}/g) || [];
+  const freq = new Map<string, number>();
+
+  for (const word of words) {
+    if (STOPWORDS.has(word) || word.length < 4) continue;
+    freq.set(word, (freq.get(word) || 0) + 1);
+  }
+
+  // Also find bigrams (two-word terms are often more meaningful)
+  const tokens = text.toLowerCase().split(/\s+/);
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const a = tokens[i].replace(/[^a-z-]/g, "");
+    const b = tokens[i + 1].replace(/[^a-z-]/g, "");
+    if (
+      a.length >= 3 &&
+      b.length >= 3 &&
+      !STOPWORDS.has(a) &&
+      !STOPWORDS.has(b)
+    ) {
+      const bigram = `${a} ${b}`;
+      freq.set(bigram, (freq.get(bigram) || 0) + 2); // weight bigrams higher
+    }
+  }
+
+  return Array.from(freq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, count)
+    .map(([term, c]) => ({
+      term: term
+        .split(" ")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" "),
+      count: c,
+    }));
+}
+
+/**
+ * Detect and extract paper sections
+ */
+function extractSections(text: string): {
+  contents: Map<string, string>;
+  order: string[];
+} {
+  const contents = new Map<string, string>();
+  const order: string[] = [];
+
+  // Common section heading patterns
+  const headingPattern =
+    /(?:^|\n)\s*(?:\d+\.?\s+)?(Abstract|Introduction|Related\s+Work|Background|Methodology|Methods?|Model(?:\s+Architecture)?|Approach|Framework|Experiments?|Results?(?:\s+and\s+Discussion)?|Discussion|Conclusion|Summary|Training|Evaluation|Analysis|Implementation)\b/gi;
+
+  const matches: { name: string; index: number }[] = [];
+  let match;
+  while ((match = headingPattern.exec(text)) !== null) {
+    matches.push({
+      name: match[1].trim(),
+      index: match.index,
+    });
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index + matches[i].name.length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : start + 5000;
+    const content = text
+      .substring(start, Math.min(end, start + 5000))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (content.length > 50) {
+      const name = matches[i].name;
+      contents.set(name.toLowerCase(), content);
+      order.push(name);
+    }
+  }
+
+  return { contents, order };
+}
+
+/**
+ * Extract numerical metrics and results from text
+ */
+function extractMetrics(text: string): string[] {
+  const patterns = [
+    // BLEU, accuracy, F1 scores etc.
+    /(?:achieve|obtain|reach|score|improve)\w*\s+(?:a\s+)?(?:(?:BLEU|accuracy|F1|precision|recall|score)\s+(?:of\s+)?)?(\d+\.?\d*)\s*%?\s*(?:BLEU|accuracy|F1|points?)?/gi,
+    // "X% improvement"
+    /(\d+\.?\d*)\s*%?\s*(?:improvement|reduction|increase|better|higher|lower)/gi,
+    // "state-of-the-art" or "SOTA"
+    /(?:state-of-the-art|SOTA|new record|best[\s-]?(?:known|result)|outperform)/gi,
+  ];
+
+  const results: string[] = [];
+  for (const pattern of patterns) {
+    let m;
+    while ((m = pattern.exec(text)) !== null) {
+      const context = text.substring(
+        Math.max(0, m.index - 40),
+        Math.min(text.length, m.index + m[0].length + 40)
+      );
+      results.push(context.replace(/\s+/g, " ").trim());
+    }
+  }
+
+  return [...new Set(results)].slice(0, 5);
+}
+
+/**
+ * Analyze the full paper text and extract structured information
+ */
+function analyzePaper(text: string): PaperAnalysis {
+  const cleaned = text.replace(/\s+/g, " ");
+
+  // Extract abstract
+  let abstract = "";
+  const absIdx = cleaned.toLowerCase().indexOf("abstract");
+  if (absIdx !== -1) {
+    const after = cleaned.substring(absIdx + 8, absIdx + 2000);
+    const endMatch = after.match(
+      /\b(?:1\.?\s*)?(?:introduction|keywords?|index\s+terms)\b/i
+    );
+    abstract = after.substring(0, endMatch?.index || 1000).trim();
+  }
+  if (abstract.length < 50) {
+    abstract = cleaned.substring(0, 1000);
+  }
+
+  // Extract sections
+  const { contents: sectionContents, order: sectionOrder } =
+    extractSections(text);
+
+  // Extract key terms
+  const keyTerms = extractKeyTerms(text, 12);
+
+  // Detect main topic from abstract + title
+  const mainTopic =
+    keyTerms.length > 0
+      ? keyTerms
+          .slice(0, 3)
+          .map((t) => t.term)
+          .join(", ")
+      : "this research topic";
+
+  // Extract key sentences for each section type
+  const problemKeywords = [
+    "problem",
+    "challenge",
+    "limitation",
+    "gap",
+    "issue",
+    "difficult",
+    "lack",
+    "fail",
+    "suffer",
+    "bottleneck",
+    "drawback",
+    "expensive",
+    "slow",
+    "sequential",
+    "constraint",
+  ];
+  const methodKeywords = [
+    "propose",
+    "introduce",
+    "present",
+    "novel",
+    "architecture",
+    "framework",
+    "mechanism",
+    "algorithm",
+    "design",
+    "develop",
+    "model",
+    "technique",
+    "component",
+    "layer",
+    "function",
+  ];
+  const resultKeywords = [
+    "achieve",
+    "outperform",
+    "improve",
+    "accuracy",
+    "score",
+    "BLEU",
+    "F1",
+    "state-of-the-art",
+    "better",
+    "faster",
+    "superior",
+    "significant",
+    "baseline",
+    "compared",
+  ];
+  const impactKeywords = [
+    "impact",
+    "enable",
+    "future",
+    "potential",
+    "application",
+    "demonstrate",
+    "open",
+    "extend",
+    "foundation",
+    "widely",
+    "broadly",
+    "significant",
+    "advance",
+    "contribute",
+  ];
+
+  const introText =
+    sectionContents.get("introduction") || cleaned.substring(0, 3000);
+  const methodText =
+    sectionContents.get("method") ||
+    sectionContents.get("methods") ||
+    sectionContents.get("model architecture") ||
+    sectionContents.get("methodology") ||
+    sectionContents.get("approach") ||
+    sectionContents.get("framework") ||
+    "";
+  const resultsText =
+    sectionContents.get("results") ||
+    sectionContents.get("experiments") ||
+    sectionContents.get("results and discussion") ||
+    sectionContents.get("evaluation") ||
+    "";
+  const conclusionText =
+    sectionContents.get("conclusion") ||
+    sectionContents.get("discussion") ||
+    sectionContents.get("summary") ||
+    "";
+
+  const keySentences = {
+    problem: findSentences(introText || abstract, problemKeywords, 3),
+    method: findSentences(methodText || abstract, methodKeywords, 3),
+    results: findSentences(resultsText || abstract, resultKeywords, 3),
+    impact: findSentences(
+      conclusionText || abstract,
+      impactKeywords,
+      3
+    ),
+  };
+
+  // Extract metrics
+  const metrics = extractMetrics(text);
+
+  return {
+    abstract,
+    sectionContents,
+    sectionOrder,
+    keyTerms,
+    keySentences,
+    metrics,
+    mainTopic,
+  };
+}
+
+// ─────────────────────────────────────────────
+// Explanation Generator
+// ─────────────────────────────────────────────
+
+function trimToSentence(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  const cut = text.substring(0, maxLen);
+  const lastPeriod = cut.lastIndexOf(".");
+  if (lastPeriod > maxLen * 0.5) {
+    return cut.substring(0, lastPeriod + 1);
+  }
+  return cut.trim() + "...";
+}
 
 function generateExplanation(
   text: string,
   depth: DepthLevel
 ): Explanation {
-  const title = extractTitle(text);
-  const isHighSchool = depth === "high-school";
-  const isUndergrad = depth === "undergrad";
+  const analysis = analyzePaper(text);
+  const isHS = depth === "high-school";
+  const isUG = depth === "undergrad";
+  const isGrad = depth === "graduate";
+
+  const topTerms = analysis.keyTerms.slice(0, 5).map((t) => t.term);
+  const topicLabel =
+    topTerms.length > 0 ? topTerms.slice(0, 2).join(" and ") : "this topic";
+
+  // ── Build Sections ──
+
+  const problemSentences = analysis.keySentences.problem;
+  const methodSentences = analysis.keySentences.method;
+  const resultSentences = analysis.keySentences.results;
+  const impactSentences = analysis.keySentences.impact;
+
+  const abstractSummary = trimToSentence(analysis.abstract, 500);
 
   const sections = [
     {
       title: "The Problem",
       icon: "help-circle",
-      content: isHighSchool
-        ? `Imagine you're trying to solve a really tough puzzle, but you don't even have all the pieces yet. That's basically what the researchers behind "${title}" were dealing with. They noticed something wasn't working the way everyone assumed it did, and they wanted to figure out why. Think of it like when your Wi-Fi keeps dropping — you know something's wrong, but you need to dig deeper to find the real cause.`
-        : isUndergrad
-          ? `The research addresses a fundamental gap in our current understanding. Previous work in this field had established baseline models, but key assumptions remained untested. The authors identified that existing approaches suffered from significant limitations when applied to real-world scenarios, prompting a systematic re-examination of the underlying framework.`
-          : depth === "graduate"
-            ? `This paper tackles a well-documented limitation in the existing literature. Prior methodological approaches, while theoretically sound, exhibited poor generalizability due to oversimplified assumptions about the underlying data distribution. The authors present a formal analysis of these failure modes and propose a principled correction.`
-            : `The paper addresses the inconsistency between theoretical bounds and empirical performance observed in recent literature. Specifically, the authors demonstrate that prevailing assumptions about distributional stationarity are violated in practice, leading to systematic bias in downstream estimators. This work provides both the theoretical characterization of this failure mode and a constructive solution.`,
+      content: isHS
+        ? `Here's what this paper is tackling: ${abstractSummary}\n\nIn simpler terms, the researchers saw that existing approaches to ${topicLabel} had real limitations. ${problemSentences.length > 0 ? problemSentences[0] : "They wanted to find a better way."} This is a big deal because if we can solve this, it opens up much better technology for everyone.`
+        : isUG
+          ? `This paper addresses key limitations in the field of ${topicLabel}. ${abstractSummary}\n\n${problemSentences.length > 0 ? problemSentences.map((s) => s).join(" ") : "The existing approaches had significant shortcomings that motivated this work."}`
+          : isGrad
+            ? `The paper identifies fundamental limitations in current approaches to ${topicLabel}. ${problemSentences.length > 0 ? problemSentences.join(" ") : abstractSummary}\n\nThe abstract states: "${trimToSentence(analysis.abstract, 300)}"`
+            : `${abstractSummary}\n\n${problemSentences.length > 0 ? "Specific limitations identified: " + problemSentences.join(" ") : "The work addresses gaps in the existing literature on " + topicLabel + "."}`,
     },
     {
       title: "The Approach",
       icon: "lightbulb",
-      content: isHighSchool
-        ? `Here's where it gets cool. Instead of doing things the old way, the researchers tried something totally different — kind of like using a shortcut in a video game that nobody knew about. They built a new method that could handle messier, more realistic data. They tested it step by step, like a science fair project but way more advanced, making sure each part actually worked before moving on.`
-        : isUndergrad
-          ? `The researchers developed a novel framework that relaxes several key assumptions of prior work. Their approach combines established statistical methods with a new adaptive component that adjusts to the characteristics of the input data. The methodology was validated through a series of controlled experiments on both synthetic and real-world datasets.`
-          : depth === "graduate"
-            ? `The authors introduce a hybrid methodology combining non-parametric estimation with regularized optimization. The key technical contribution is a novel loss function that accounts for heteroscedasticity in the feature space. Convergence guarantees are provided under mild regularity conditions, with explicit finite-sample bounds.`
-            : `The core contribution is a two-stage estimator: first, a sieve-based approximation to the nuisance parameter, followed by a targeted correction using influence functions. The authors establish root-n consistency and semiparametric efficiency under conditions substantially weaker than those required by existing methods. The proof leverages recent advances in empirical process theory.`,
+      content: isHS
+        ? `The researchers came up with a creative solution involving ${topicLabel}. ${methodSentences.length > 0 ? methodSentences[0] : "They designed a new approach that works differently from what came before."}\n\n${methodSentences.length > 1 ? "Specifically, " + methodSentences[1] : "Their key idea was to rethink the standard approach and build something that addresses the core problem directly."} Think of it as building a completely new tool instead of just patching the old one.`
+        : isUG
+          ? `The authors propose a novel approach centered on ${topicLabel}. ${methodSentences.join(" ")}\n\n${analysis.metrics.length > 0 ? "The method was evaluated with metrics including: " + analysis.metrics.slice(0, 2).join("; ") + "." : ""}`
+          : isGrad
+            ? `The core technical contribution involves ${topicLabel}. ${methodSentences.join(" ")}\n\nKey components include: ${topTerms.join(", ")}. ${analysis.metrics.length > 0 ? "Evaluation metrics: " + analysis.metrics.join("; ") : ""}`
+            : `${methodSentences.join(" ")}\n\nThe paper introduces advances in: ${topTerms.join(", ")}. ${analysis.metrics.length > 0 ? "\n\nQuantitative evaluation: " + analysis.metrics.join("; ") : ""}`,
     },
     {
       title: "The Discovery",
       icon: "sparkles",
-      content: isHighSchool
-        ? `And the results? Pretty mind-blowing. Their new method worked WAY better than what people were using before — like upgrading from a bicycle to a sports car. The improvements weren't tiny either; we're talking about a major jump in accuracy. The best part? It worked across lots of different types of data, not just one specific case. That's like finding a study hack that works for every subject, not just math.`
-        : isUndergrad
-          ? `The experimental results demonstrated significant improvements across all evaluation metrics. The proposed method achieved a substantial reduction in error rates compared to the baseline approaches, with particularly strong performance on challenging edge cases. Statistical significance was confirmed through rigorous hypothesis testing with appropriate corrections for multiple comparisons.`
-          : depth === "graduate"
-            ? `The proposed estimator achieved demonstrably lower MSE across all experimental conditions, with the improvement being most pronounced in high-dimensional settings. The empirical convergence rates matched the theoretical predictions. Ablation studies confirmed the necessity of each component of the proposed framework, and sensitivity analyses demonstrated robustness to hyperparameter choices.`
-            : `The empirical results validate the theoretical predictions: the proposed estimator achieves the semiparametric efficiency bound in finite samples, with coverage rates of confidence intervals matching nominal levels. The improvement over plug-in estimators is most pronounced under model misspecification, confirming the double-robustness property. Cross-validation experiments on held-out data demonstrate genuine predictive improvement.`,
+      content: isHS
+        ? `The results were impressive. ${resultSentences.length > 0 ? resultSentences[0] : "Their new approach performed significantly better than previous methods."}\n\n${analysis.metrics.length > 0 ? "In numbers, they found: " + analysis.metrics[0] + ". " : ""}${resultSentences.length > 1 ? resultSentences[1] : "This isn't just a small improvement — it represents a real step forward in the field."}`
+        : isUG
+          ? `The experimental results demonstrate significant improvements. ${resultSentences.join(" ")}\n\n${analysis.metrics.length > 0 ? "Key results: " + analysis.metrics.join("; ") : "The approach outperformed existing baselines across evaluation metrics."}`
+          : isGrad
+            ? `${resultSentences.join(" ")}\n\n${analysis.metrics.length > 0 ? "Quantitative results:\n" + analysis.metrics.map((m) => "- " + m).join("\n") : "Results demonstrate improvements over existing approaches."}`
+            : `${resultSentences.join(" ")}\n\n${analysis.metrics.length > 0 ? "Empirical results:\n" + analysis.metrics.map((m) => "- " + m).join("\n") : ""}`,
     },
     {
       title: "The Impact",
       icon: "rocket",
-      content: isHighSchool
-        ? `So why should you care? Because this research could change how we solve real problems — from making better medical diagnoses to creating smarter apps on your phone. It's like when someone figured out that washing hands prevents disease — a simple idea that changed everything. This paper opens up new doors that other scientists can now walk through, and the ripple effects could touch your everyday life sooner than you think.`
-        : isUndergrad
-          ? `This work has broad implications for both the research community and practical applications. The improved methodology enables more reliable analysis in domains ranging from healthcare to technology. The open-source implementation provided by the authors lowers the barrier to adoption. Several follow-up studies have already begun extending these results to related problem settings.`
-          : depth === "graduate"
-            ? `The theoretical contributions extend beyond the specific application domain. The general framework introduced here is applicable to any setting where distributional shift is a concern. The relaxed assumptions make the method viable for practitioners working with messy real-world data. The code release and reproducibility package facilitate direct comparison in future work.`
-            : `This work resolves a longstanding open question in the field regarding the achievability of efficient estimation under minimal assumptions. The theoretical framework has immediate implications for causal inference, missing data problems, and transfer learning. The constructive proof technique — combining sieve estimation with targeted learning — provides a general template applicable to a broad class of semiparametric models.`,
+      content: isHS
+        ? `So why does this matter? ${impactSentences.length > 0 ? impactSentences[0] : "This research on " + topicLabel + " could change how we build technology."}\n\nThe advances in ${topicLabel} from this paper could lead to better tools that affect your daily life — from smarter apps to better translation services to more capable AI assistants. ${impactSentences.length > 1 ? impactSentences[1] : "It's the kind of research that other scientists will build on for years to come."}`
+        : isUG
+          ? `This work has significant implications for ${topicLabel} and adjacent fields. ${impactSentences.join(" ")}\n\nThe contributions extend the current state of the art and open new research directions.`
+          : isGrad
+            ? `${impactSentences.join(" ")}\n\nThe theoretical and practical contributions to ${topicLabel} establish a new foundation for future work in this area.`
+            : `${impactSentences.join(" ")}\n\nBroader implications span ${topicLabel} and related domains, with potential for significant impact on both theoretical understanding and practical applications.`,
     },
   ];
 
-  const paperMap = [
-    {
-      id: "problem",
-      label: "Problem",
-      description: isHighSchool
-        ? "Something isn't working right"
-        : "Gap in existing approaches",
-      color: "#EF4444",
-    },
-    {
-      id: "method",
-      label: "Method",
-      description: isHighSchool
-        ? "A clever new approach"
-        : "Novel framework and methodology",
-      color: "#F97316",
-    },
-    {
-      id: "findings",
-      label: "Findings",
-      description: isHighSchool
-        ? "It works much better!"
-        : "Significant improvement in results",
-      color: "#10B981",
-    },
-    {
-      id: "impact",
-      label: "Impact",
-      description: isHighSchool
-        ? "This changes the game"
-        : "Broad implications for the field",
-      color: "#7C3AED",
-    },
-  ];
+  // ── Build Paper Map (from actual sections) ──
+  const detectColor = (name: string): string => {
+    const n = name.toLowerCase();
+    if (
+      n.includes("intro") ||
+      n.includes("problem") ||
+      n.includes("background") ||
+      n.includes("related")
+    )
+      return "#EF4444";
+    if (
+      n.includes("method") ||
+      n.includes("model") ||
+      n.includes("approach") ||
+      n.includes("architecture") ||
+      n.includes("framework")
+    )
+      return "#F97316";
+    if (
+      n.includes("result") ||
+      n.includes("experiment") ||
+      n.includes("eval") ||
+      n.includes("training")
+    )
+      return "#10B981";
+    if (
+      n.includes("conclu") ||
+      n.includes("discuss") ||
+      n.includes("summary") ||
+      n.includes("future")
+    )
+      return "#7C3AED";
+    return "#6B7280";
+  };
 
-  const soWhat = isHighSchool
+  let paperMap;
+  if (analysis.sectionOrder.length >= 3) {
+    // Use actual paper sections
+    paperMap = analysis.sectionOrder.slice(0, 6).map((name, i) => {
+      const content = analysis.sectionContents.get(name.toLowerCase()) || "";
+      const firstSentence = content.split(/[.!?]/)[0]?.trim() || "";
+      return {
+        id: name.toLowerCase().replace(/\s+/g, "-"),
+        label: name,
+        description: isHS
+          ? trimToSentence(firstSentence, 60)
+          : trimToSentence(firstSentence, 80),
+        color: detectColor(name),
+      };
+    });
+  } else {
+    // Fallback: generic structure with paper-specific content
+    paperMap = [
+      {
+        id: "problem",
+        label: "Problem",
+        description: isHS
+          ? `Limitations in ${topicLabel}`
+          : `Addressing gaps in ${topicLabel}`,
+        color: "#EF4444",
+      },
+      {
+        id: "method",
+        label: "Method",
+        description: isHS
+          ? `New approach using ${topTerms[0] || "novel techniques"}`
+          : `Proposed framework for ${topicLabel}`,
+        color: "#F97316",
+      },
+      {
+        id: "findings",
+        label: "Findings",
+        description: isHS
+          ? "Significant improvements found"
+          : "Demonstrated improvements over baselines",
+        color: "#10B981",
+      },
+      {
+        id: "impact",
+        label: "Impact",
+        description: isHS
+          ? `Advances ${topicLabel}`
+          : `Broad implications for ${topicLabel}`,
+        color: "#7C3AED",
+      },
+    ];
+  }
+
+  // ── Key Terms (from actual paper) ──
+  const keyTerms = analysis.keyTerms.slice(0, 6).map((t) => {
+    // Try to find a definition/context sentence in the text
+    const termLower = t.term.toLowerCase();
+    const contextPattern = new RegExp(
+      `[^.]*\\b${termLower.replace(/\s+/g, "\\s+")}\\b[^.]*\\.`,
+      "i"
+    );
+    const contextMatch = text.match(contextPattern);
+    const contextSentence = contextMatch
+      ? contextMatch[0].trim()
+      : "";
+
+    const definition = isHS
+      ? contextSentence
+        ? `From the paper: "${trimToSentence(contextSentence, 120)}"`
+        : `A key concept in this paper (mentioned ${t.count} times)`
+      : contextSentence
+        ? trimToSentence(contextSentence, 150)
+        : `Central concept in this work (frequency: ${t.count})`;
+
+    return { term: t.term, definition };
+  });
+
+  // ── So What ──
+  const soWhat = isHS
     ? [
-        "This could help doctors diagnose diseases faster and more accurately",
-        "The technology behind your favorite apps could get smarter because of this",
-        "It shows that questioning 'the way things are done' can lead to breakthroughs",
-        "Students like you might use tools built on this research in college",
+        `This research on ${topicLabel} pushes the boundaries of what's possible in this field`,
+        impactSentences[0] ||
+          `The findings could lead to better tools and technology that affect everyday life`,
+        `It demonstrates that challenging established approaches can lead to breakthroughs`,
+        `Students and researchers can build on this work to create even better solutions`,
       ]
     : [
-        "Enables more reliable decision-making in high-stakes domains",
-        "Provides a general framework extensible to adjacent research areas",
-        "Reduces the gap between theoretical models and practical applications",
-        "Opens new avenues for interdisciplinary collaboration",
-      ];
-
-  const keyTerms = isHighSchool
-    ? [
-        {
-          term: "Methodology",
-          definition:
-            "The game plan or recipe the researchers followed to do their experiment",
-        },
-        {
-          term: "Hypothesis",
-          definition:
-            "An educated guess about what they thought would happen",
-        },
-        {
-          term: "Data",
-          definition:
-            "The information they collected — like scores, measurements, or observations",
-        },
-        {
-          term: "Statistical Significance",
-          definition:
-            "A fancy way of saying the results probably weren't just luck",
-        },
-      ]
-    : [
-        {
-          term: "Distributional Shift",
-          definition:
-            "When the statistical properties of data change between training and deployment",
-        },
-        {
-          term: "Regularization",
-          definition:
-            "Techniques to prevent models from memorizing noise in the data",
-        },
-        {
-          term: "Convergence Rate",
-          definition:
-            "How quickly an estimator approaches the true value as sample size grows",
-        },
-        {
-          term: "Ablation Study",
-          definition:
-            "Removing components one at a time to measure each one's contribution",
-        },
+        impactSentences[0] ||
+          `Establishes new benchmarks for ${topicLabel}`,
+        `Provides a framework that can be extended to related domains`,
+        analysis.metrics[0] ||
+          `Demonstrates significant improvements over existing approaches`,
+        `Opens new research directions at the intersection of ${topTerms.slice(0, 3).join(", ")}`,
       ];
 
   return { depth, sections, paperMap, soWhat, keyTerms };
 }
 
-function extractTitle(text: string): string {
-  const lines = text.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length > 0) {
-    const firstLine = lines[0].trim();
-    if (firstLine.length > 10 && firstLine.length < 200) {
-      return firstLine;
+// ─────────────────────────────────────────────
+// Q&A (uses paper text for context)
+// ─────────────────────────────────────────────
+
+function generateQAResponse(paperText: string, question: string): string {
+  const analysis = analyzePaper(paperText);
+  const q = question.toLowerCase();
+  const topTerms = analysis.keyTerms.slice(0, 5).map((t) => t.term);
+
+  if (q.includes("method") || q.includes("how") || q.includes("approach")) {
+    const methodSentences = analysis.keySentences.method;
+    if (methodSentences.length > 0) {
+      return `Based on the paper, here's what the researchers did:\n\n${methodSentences.join("\n\n")}\n\nThe key technical concepts involved are: ${topTerms.join(", ")}.`;
     }
+    return `The paper's approach centers on ${topTerms.join(", ")}. The researchers built on existing work but introduced key innovations in these areas.`;
   }
-  return "this research paper";
+
+  if (q.includes("result") || q.includes("find") || q.includes("found") || q.includes("performance")) {
+    const resultSentences = analysis.keySentences.results;
+    if (resultSentences.length > 0 || analysis.metrics.length > 0) {
+      return `Here are the key findings:\n\n${resultSentences.join("\n\n")}${analysis.metrics.length > 0 ? "\n\nSpecific metrics reported: " + analysis.metrics.join("; ") : ""}`;
+    }
+    return `The paper reports improvements in ${topTerms.join(", ")} over existing approaches. The results demonstrate the effectiveness of the proposed method.`;
+  }
+
+  if (q.includes("why") || q.includes("important") || q.includes("matter") || q.includes("significance")) {
+    const impactSentences = analysis.keySentences.impact;
+    return `This paper matters because:\n\n${impactSentences.length > 0 ? impactSentences.join("\n\n") : "It advances our understanding of " + topTerms.join(", ") + "."}\n\nThe work on ${analysis.mainTopic} has broad implications for the field and potential real-world applications.`;
+  }
+
+  if (q.includes("limit") || q.includes("weakness") || q.includes("drawback") || q.includes("future")) {
+    // Look for limitation sentences
+    const limitSentences = findSentences(paperText, [
+      "limitation",
+      "future work",
+      "drawback",
+      "challenge",
+      "remain",
+      "further",
+      "not yet",
+      "beyond the scope",
+    ], 3);
+    if (limitSentences.length > 0) {
+      return `The paper acknowledges several limitations:\n\n${limitSentences.join("\n\n")}`;
+    }
+    return `While the paper makes significant contributions to ${analysis.mainTopic}, as with any research, there are areas for future work. The authors' approach to ${topTerms[0] || "the problem"} could be extended and validated in additional settings.`;
+  }
+
+  if (q.includes("abstract") || q.includes("summary") || q.includes("about")) {
+    return `Here's what this paper is about:\n\n${trimToSentence(analysis.abstract, 600)}\n\nThe main topics covered are: ${topTerms.join(", ")}.`;
+  }
+
+  // Generic response using paper content
+  const relevant = findSentences(paperText, question.split(/\s+/).filter((w) => w.length > 3), 3);
+  if (relevant.length > 0) {
+    return `Based on the paper, here's what I found relevant to your question:\n\n${relevant.join("\n\n")}\n\nThis relates to the paper's work on ${analysis.mainTopic}.`;
+  }
+
+  return `This paper focuses on ${analysis.mainTopic}. The key concepts are ${topTerms.join(", ")}.\n\nFrom the abstract: "${trimToSentence(analysis.abstract, 300)}"\n\nCould you rephrase your question? I can help with the method, results, limitations, or significance of this paper.`;
 }
 
-function generateQAResponse(question: string): string {
-  const q = question.toLowerCase();
-  if (q.includes("method") || q.includes("how")) {
-    return "Great question! The researchers used a step-by-step approach. First, they gathered data from multiple sources to make sure their sample was representative. Then they applied their new technique, which is kind of like having a smarter filter that adapts to what it's looking at. They compared the results against three existing methods to prove theirs was better. Think of it like testing a new recipe by comparing it to the original — you need to show it actually tastes better, not just claim it does!";
-  }
-  if (q.includes("result") || q.includes("find") || q.includes("found")) {
-    return "The key finding was that their approach outperformed existing methods by a significant margin. In non-technical terms: imagine the old method was getting the right answer 70% of the time. Their new method bumped that up to around 90%. That might not sound huge, but in fields like medicine or engineering, that 20% difference could mean saving lives or preventing failures.";
-  }
-  if (q.includes("why") || q.includes("important") || q.includes("matter")) {
-    return "This matters because it solves a problem that has been bugging researchers for years. The old methods worked okay in theory but fell apart when you used them on real, messy data — kind of like how a map works great until you're actually in the forest and the trail doesn't match. This paper bridges that gap between theory and practice, which means the tools we build based on this research will actually work in the real world.";
-  }
-  if (q.includes("limit") || q.includes("weakness") || q.includes("wrong")) {
-    return "No research is perfect, and the authors are honest about that. Their method requires more computing power than simpler approaches — think of it like needing a gaming PC instead of a regular laptop. Also, they tested it on specific types of data, so we don't know yet if it works equally well for everything. Future researchers will need to test it in more scenarios. But that's how science works — each paper moves us forward a little bit!";
-  }
-  return "That's a thoughtful question! Based on the paper, the researchers built on previous work but took a fundamentally different approach. They recognized that the standard assumptions didn't hold up in practice, so they designed a more flexible framework. The key innovation is that their method doesn't require the same strict conditions that previous approaches needed, making it much more practical for real-world use. It's like inventing an all-terrain vehicle when everyone else was building sports cars — not as flashy, but it actually works on real roads!";
-}
+// ─────────────────────────────────────────────
+// Service Export
+// ─────────────────────────────────────────────
 
 export class MockAIService implements AIService {
   async explainPaper(
     text: string,
     depth: DepthLevel
   ): Promise<Explanation> {
-    // Simulate processing delay
     await new Promise((resolve) => setTimeout(resolve, 1500));
     return generateExplanation(text, depth);
   }
 
   async askQuestion(
-    _paperText: string,
+    paperText: string,
     question: string,
     _history: QAMessage[]
   ): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, 800));
-    return generateQAResponse(question);
+    return generateQAResponse(paperText, question);
   }
 }
 
